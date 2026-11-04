@@ -21,6 +21,39 @@ pub struct File {
     pub deleted_at: Option<i64>,
     /// The upload link it came through, if any.
     pub invite: Option<String>,
+    /// For one-time secrets: `file` or `text`. Their data is encrypted in
+    /// the browser and can be downloaded once.
+    pub secret: Option<String>,
+    /// Lets the recipient's page tell a damaged link from a good one
+    /// without opening the secret.
+    pub key_check: Option<String>,
+    /// Token of the secret's receipt page.
+    pub receipt: Option<String>,
+    pub opened_at: Option<i64>,
+}
+
+impl File {
+    /// Why a secret is gone: `opened`, `expired` or `burned`; `None` if it
+    /// can still be opened.
+    pub fn secret_end(&self) -> Option<&'static str> {
+        let deleted = self.deleted_at?;
+        Some(if self.opened_at.is_some() {
+            "opened"
+        } else if self.expires_at.is_some_and(|t| t <= deleted) {
+            "expired"
+        } else {
+            "burned"
+        })
+    }
+}
+
+/// Something that happened to a secret, for its receipt.
+pub struct Event {
+    pub at: i64,
+    pub kind: String,
+    pub ip: String,
+    pub agent: String,
+    pub detail: String,
 }
 
 pub struct Invite {
@@ -37,6 +70,8 @@ pub struct Invite {
     pub used_at: Option<i64>,
     pub revoked: bool,
     pub file_id: Option<String>,
+    /// What is uploaded through it is a one-time secret.
+    pub secret: bool,
 }
 
 const SCHEMA: &str = "
@@ -73,13 +108,36 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_file ON events (file_id);
 ";
 
+/// Columns added after the first release, created on older databases.
+const ADDED: [(&str, &str, &str); 5] = [
+    ("files", "secret", "TEXT"),
+    ("files", "key_check", "TEXT"),
+    ("files", "receipt", "TEXT"),
+    ("files", "opened_at", "INTEGER"),
+    ("invites", "secret", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Events kept per secret, so reloading its page cannot fill the disk.
+const MAX_EVENTS: u32 = 500;
+
 const FILE_COLS: &str = "id, name, content_type, size, stored, compressed, created_at, \
-                         expires_at, downloads, deleted_at, invite";
+                         expires_at, downloads, deleted_at, invite, secret, key_check, receipt, \
+                         opened_at";
 
 const INVITE_COLS: &str = "token, note, max_bytes, created_at, expires_at, file_ttl, claimed, \
-                           used_at, revoked, file_id";
+                           used_at, revoked, file_id, secret";
 
 fn file(r: &Row) -> rusqlite::Result<File> {
     Ok(File {
@@ -94,6 +152,10 @@ fn file(r: &Row) -> rusqlite::Result<File> {
         downloads: r.get(8)?,
         deleted_at: r.get(9)?,
         invite: r.get(10)?,
+        secret: r.get(11)?,
+        key_check: r.get(12)?,
+        receipt: r.get(13)?,
+        opened_at: r.get(14)?,
     })
 }
 
@@ -109,6 +171,7 @@ fn invite(r: &Row) -> rusqlite::Result<Invite> {
         used_at: r.get(7)?,
         revoked: r.get(8)?,
         file_id: r.get(9)?,
+        secret: r.get(10)?,
     })
 }
 
@@ -118,6 +181,23 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        for (table, column, def) in ADDED {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+                [table, column],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {def}"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS files_receipt ON files (receipt)",
+            [],
+        )?;
         // Uploads in progress died with the previous process.
         conn.execute("UPDATE invites SET claimed = 0 WHERE used_at IS NULL", [])?;
         Ok(Self(Mutex::new(conn)))
@@ -129,7 +209,9 @@ impl Db {
 
     pub fn insert_file(&self, f: &File) -> Result<()> {
         self.conn().execute(
-            &format!("INSERT INTO files ({FILE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            &format!(
+                "INSERT INTO files ({FILE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             params![
                 f.id,
                 f.name,
@@ -141,7 +223,11 @@ impl Db {
                 f.expires_at,
                 f.downloads,
                 f.deleted_at,
-                f.invite
+                f.invite,
+                f.secret,
+                f.key_check,
+                f.receipt,
+                f.opened_at
             ],
         )?;
         Ok(())
@@ -158,13 +244,78 @@ impl Db {
             .optional()?)
     }
 
-    /// Files still downloadable, newest first.
+    /// Files (not secrets) still downloadable, newest first.
     pub fn live_files(&self) -> Result<Vec<File>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {FILE_COLS} FROM files WHERE deleted_at IS NULL ORDER BY created_at DESC"
+            "SELECT {FILE_COLS} FROM files WHERE deleted_at IS NULL AND secret IS NULL \
+             ORDER BY created_at DESC"
         ))?;
         Ok(stmt.query_map([], file)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Secrets, opened or not, newest first.
+    pub fn recent_secrets(&self) -> Result<Vec<File>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FILE_COLS} FROM files WHERE secret IS NOT NULL ORDER BY created_at DESC LIMIT 100"
+        ))?;
+        Ok(stmt.query_map([], file)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn file_by_receipt(&self, receipt: &str) -> Result<Option<File>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {FILE_COLS} FROM files WHERE receipt = ?"),
+                [receipt],
+                file,
+            )
+            .optional()?)
+    }
+
+    /// Marks a secret opened if it still can be; true if this call did.
+    pub fn open_secret(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE files SET opened_at = ?1, deleted_at = ?1, downloads = downloads + 1
+             WHERE id = ?2 AND secret IS NOT NULL AND deleted_at IS NULL
+             AND (expires_at IS NULL OR expires_at > ?1)",
+            params![now, id],
+        )? == 1)
+    }
+
+    /// Adds to a secret's timeline; does nothing for other files.
+    pub fn add_event(&self, file_id: &str, kind: &str, ip: &str, agent: &str, detail: &str) {
+        let at = crate::now();
+        let res = self.conn().execute(
+            "INSERT INTO events (file_id, at, kind, ip, agent, detail)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE EXISTS (SELECT 1 FROM files WHERE id = ?1 AND secret IS NOT NULL)
+             AND (SELECT COUNT(*) FROM events WHERE file_id = ?1) < ?7",
+            params![file_id, at, kind, ip, agent, detail, MAX_EVENTS],
+        );
+        if let Err(e) = res {
+            tracing::error!("recording {kind} for {file_id}: {e:#}");
+        }
+    }
+
+    /// A secret's timeline, oldest first.
+    pub fn events(&self, file_id: &str) -> Result<Vec<Event>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT at, kind, ip, agent, detail FROM events WHERE file_id = ? ORDER BY id",
+        )?;
+        Ok(stmt
+            .query_map([file_id], |r| {
+                Ok(Event {
+                    at: r.get(0)?,
+                    kind: r.get(1)?,
+                    ip: r.get(2)?,
+                    agent: r.get(3)?,
+                    detail: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn expired_files(&self, now: i64) -> Result<Vec<String>> {
@@ -259,7 +410,9 @@ impl Db {
 
     pub fn insert_invite(&self, i: &Invite) -> Result<()> {
         self.conn().execute(
-            &format!("INSERT INTO invites ({INVITE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            &format!(
+                "INSERT INTO invites ({INVITE_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
             params![
                 i.token,
                 i.note,
@@ -270,7 +423,8 @@ impl Db {
                 i.claimed,
                 i.used_at,
                 i.revoked,
-                i.file_id
+                i.file_id,
+                i.secret
             ],
         )?;
         Ok(())

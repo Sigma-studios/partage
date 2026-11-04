@@ -1,9 +1,11 @@
-//! partage: share files through links that do not change, with a storage
-//! limit and Discord alerts. See README.md.
+//! partage: share files through links that do not change, and one-time
+//! secrets encrypted in the browser, with a storage limit and Discord
+//! alerts. See README.md.
 
 mod alert;
 mod db;
 mod html;
+mod secret;
 mod store;
 mod web;
 
@@ -68,6 +70,8 @@ pub struct App {
     alert_lock: tokio::sync::Mutex<()>,
     last_blocked_alert: Mutex<Option<Instant>>,
     login_failures: Mutex<HashMap<String, (u32, Instant)>>,
+    /// One-time secrets being uploaded.
+    uploads: secret::Uploads,
 }
 
 impl App {
@@ -168,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         alert_lock: Default::default(),
         last_blocked_alert: Default::default(),
         login_failures: Default::default(),
+        uploads: Default::default(),
     });
     app.refresh_usage();
     tracing::info!(

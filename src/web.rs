@@ -2,15 +2,17 @@
 
 use crate::{
     App, alert, db, html, now,
+    secret::{self, Client},
     store::{self, Target, UploadError},
     token,
 };
 use axum::{
-    Form, Router,
+    Form, Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, State},
     http::{HeaderMap, Method, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use std::{
@@ -30,9 +32,13 @@ pub fn router(app: AppState) -> Router {
     let uploads = Router::new()
         .route("/admin/upload", post(admin_upload))
         .route("/u/{token}", get(invite_page).post(invite_upload))
+        .route("/s/up/{upload}", put(secret_piece))
         .layer(DefaultBodyLimit::disable());
     Router::new()
-        .route("/", get(dashboard))
+        .route("/", get(home))
+        .route("/settings", get(settings))
+        .route("/track", get(track))
+        .route("/admin/usage", get(usage))
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/admin/limit", post(set_limit))
@@ -41,6 +47,15 @@ pub fn router(app: AppState) -> Router {
         .route("/admin/files/{id}/delete", post(delete_file))
         .route("/admin/invites", post(create_invite))
         .route("/admin/invites/{token}/revoke", post(revoke_invite))
+        .route("/admin/secrets", post(admin_secret))
+        .route("/u/{token}/secret", post(invite_secret))
+        .route("/s/up/{upload}/done", post(secret_done))
+        .route("/s/up/{upload}/abort", post(secret_abort))
+        .route("/s/sw.js", get(service_worker))
+        .route("/s/{id}", get(secret_page))
+        .route("/s/{id}/open", post(secret_open))
+        .route("/r/{token}", get(receipt))
+        .route("/r/{token}/burn", post(burn))
         .route("/f/{id}", get(download))
         .route("/health", get(|| async { "ok" }))
         .merge(uploads)
@@ -48,7 +63,7 @@ pub fn router(app: AppState) -> Router {
 }
 
 /// Where the app is reached, for the links it hands out.
-fn base_url(app: &App, headers: &HeaderMap) -> String {
+pub fn base_url(app: &App, headers: &HeaderMap) -> String {
     if let Some(url) = &app.cfg.public_url {
         return url.clone();
     }
@@ -76,7 +91,7 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// The visitor's address, as facade's entry point reports it.
-fn client_ip(headers: &HeaderMap) -> String {
+pub fn client_ip(headers: &HeaderMap) -> String {
     headers
         .get("x-real-ip")
         .and_then(|h| h.to_str().ok())
@@ -194,7 +209,7 @@ struct Flash {
     msg: Option<String>,
 }
 
-/// Messages a redirect back to the dashboard can show.
+/// Messages a redirect back to the settings can show.
 fn flash_text(key: &str) -> Option<&'static str> {
     Some(match key {
         "limit" => "Storage limit updated.",
@@ -205,36 +220,80 @@ fn flash_text(key: &str) -> Option<&'static str> {
         "webhook-removed" => "Discord webhook removed: no alerts will be sent.",
         "bad-webhook" => "That is not a Discord webhook URL (https://discord.com/api/webhooks/…).",
         "deleted" => "File deleted.",
+        "burned" => "Secret burned: its link no longer opens anything.",
+        "too-late" => "This secret was already opened, expired or burned.",
         "invite" => "Upload link created: copy it from the list below.",
         "revoked" => "Upload link revoked.",
         "bad-size" => "That size is not valid.",
+        "bad-invite" => "Those sizes or durations are not valid.",
         _ => return None,
     })
 }
 
+/// Back to the settings, or to the tracking page for what it lists.
 fn back(msg: &str) -> Response {
-    Redirect::to(&format!("/?msg={msg}")).into_response()
+    let page = match msg {
+        "deleted" | "burned" | "too-late" | "invite" | "revoked" | "bad-invite" => "track",
+        _ => "settings",
+    };
+    Redirect::to(&format!("/{page}?msg={msg}")).into_response()
 }
 
-async fn dashboard(
+/// The drop zone.
+async fn home(_: Admin, State(app): State<AppState>) -> Html<String> {
+    Html(html::home(app.used(), app.limit()))
+}
+
+async fn usage(_: Admin, State(app): State<AppState>) -> Response {
+    Json(serde_json::json!({ "used": app.used(), "limit": app.limit() })).into_response()
+}
+
+async fn settings(
+    _: Admin,
+    State(app): State<AppState>,
+    Query(flash): Query<Flash>,
+) -> Html<String> {
+    Html(html::settings(&html::Settings {
+        flash: flash.msg.as_deref().and_then(flash_text),
+        used: app.used(),
+        limit: app.limit(),
+        webhook: app.webhook().is_some(),
+    }))
+}
+
+/// Files, secrets and upload links.
+async fn track(
     _: Admin,
     State(app): State<AppState>,
     headers: HeaderMap,
     Query(flash): Query<Flash>,
 ) -> Response {
-    let (files, invites) = match (app.db.live_files(), app.db.recent_invites()) {
-        (Ok(f), Ok(i)) => (f, i),
-        (Err(e), _) | (_, Err(e)) => return internal(e),
+    let (files, secrets, invites) = match (
+        app.db.live_files(),
+        app.db.recent_secrets(),
+        app.db.recent_invites(),
+    ) {
+        (Ok(f), Ok(s), Ok(i)) => (f, s, i),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return internal(e),
     };
+    // Receipts of secrets sent through upload links.
+    let mut receipts = std::collections::HashMap::new();
+    for i in invites.iter().filter(|i| i.secret) {
+        if let Some(id) = &i.file_id
+            && let Ok(Some(f)) = app.db.file(id)
+            && let Some(r) = f.receipt
+        {
+            receipts.insert(id.clone(), r);
+        }
+    }
     let base = base_url(&app, &headers);
-    Html(html::dashboard(&html::Dashboard {
+    Html(html::track(&html::Track {
         base: &base,
         flash: flash.msg.as_deref().and_then(flash_text),
-        used: app.used(),
-        limit: app.limit(),
-        webhook: app.webhook().is_some(),
         files: &files,
+        secrets: &secrets,
         invites: &invites,
+        receipts: &receipts,
     }))
     .into_response()
 }
@@ -331,9 +390,22 @@ async fn test_alert(_: Admin, State(app): State<AppState>) -> Response {
 }
 
 async fn delete_file(_: Admin, State(app): State<AppState>, Path(id): Path<String>) -> Response {
-    store::remove(&app, &id).await;
+    let msg = match app.db.file(&id) {
+        Ok(Some(f)) if f.secret.is_some() => {
+            if secret::burn(&app, &f, "by the admin").await {
+                "burned"
+            } else {
+                "too-late"
+            }
+        }
+        Ok(_) => {
+            store::remove(&app, &id).await;
+            "deleted"
+        }
+        Err(e) => return internal(e),
+    };
     alert::check_usage(&app).await;
-    back("deleted")
+    back(msg)
 }
 
 async fn admin_upload(
@@ -360,6 +432,7 @@ struct InviteForm {
     valid_for: f64,
     valid_unit: String,
     file_days: String,
+    secret: Option<String>,
 }
 
 async fn create_invite(
@@ -368,7 +441,7 @@ async fn create_invite(
     Form(form): Form<InviteForm>,
 ) -> Response {
     let Some(max_bytes) = bytes(form.amount, &form.unit) else {
-        return back("bad-size");
+        return back("bad-invite");
     };
     let valid = form.valid_for
         * match form.valid_unit.as_str() {
@@ -379,11 +452,11 @@ async fn create_invite(
         "" => None,
         days => match days.parse::<f64>() {
             Ok(d) if d > 0.0 && d.is_finite() => Some((d * 86400.0) as i64),
-            _ => return back("bad-size"),
+            _ => return back("bad-invite"),
         },
     };
     if !(valid.is_finite() && valid > 0.0) {
-        return back("bad-size");
+        return back("bad-invite");
     }
     let now = now();
     let invite = db::Invite {
@@ -397,6 +470,7 @@ async fn create_invite(
         used_at: None,
         revoked: false,
         file_id: None,
+        secret: form.secret.is_some(),
     };
     if let Err(e) = app.db.insert_invite(&invite) {
         return internal(e);
@@ -439,6 +513,15 @@ async fn invite_upload(
     Path(token): Path<String>,
     form: Multipart,
 ) -> Response {
+    if let Ok(Some(i)) = app.db.invite(&token)
+        && i.secret
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "This upload link only takes encrypted secrets: reload the page.",
+        )
+            .into_response();
+    }
     let invite = match app.db.claim_invite(&token, now()) {
         Ok(true) => match app.db.invite(&token) {
             Ok(Some(i)) => i,
@@ -479,4 +562,116 @@ async fn invite_upload(
 
 async fn download(State(app): State<AppState>, method: Method, Path(id): Path<String>) -> Response {
     store::download(&app, &id, method == Method::HEAD).await
+}
+
+async fn admin_secret(
+    _: Admin,
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<secret::CreateReq>,
+) -> Response {
+    secret::create(&app, req, None, Client::from(&headers)).await
+}
+
+async fn invite_secret(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(req): Json<secret::CreateReq>,
+) -> Response {
+    let invite = match app.db.invite(&token) {
+        Ok(Some(i)) if i.secret => i,
+        Ok(_) => return invite_unusable(),
+        Err(e) => return internal(e),
+    };
+    match app.db.claim_invite(&token, now()) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::GONE,
+                "This upload link has already been used, has expired, or is in use right now.",
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+    let res = secret::create(&app, req, Some(invite), Client::from(&headers)).await;
+    if !res.status().is_success()
+        && let Err(e) = app.db.release_invite(&token)
+    {
+        tracing::error!("releasing upload link: {e:#}");
+    }
+    res
+}
+
+#[derive(Deserialize)]
+struct Offset {
+    offset: u64,
+}
+
+async fn secret_piece(
+    State(app): State<AppState>,
+    Path(upload): Path<String>,
+    Query(q): Query<Offset>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    secret::piece(&app, &upload, q.offset, &headers, body).await
+}
+
+async fn secret_done(
+    State(app): State<AppState>,
+    Path(upload): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    secret::finish(&app, &upload, &headers).await
+}
+
+async fn secret_abort(State(app): State<AppState>, Path(upload): Path<String>) -> Response {
+    secret::abort(&app, &upload).await
+}
+
+async fn secret_page(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    secret::page(&app, &id, &Client::from(&headers))
+}
+
+async fn secret_open(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    secret::open(&app, &id, Client::from(&headers)).await
+}
+
+async fn service_worker() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        html::SERVICE_WORKER,
+    )
+        .into_response()
+}
+
+async fn receipt(
+    State(app): State<AppState>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    Query(flash): Query<Flash>,
+) -> Response {
+    secret::receipt(
+        &app,
+        &token,
+        &headers,
+        flash.msg.as_deref().and_then(flash_text),
+    )
+}
+
+async fn burn(State(app): State<AppState>, Path(token): Path<String>) -> Response {
+    secret::burn_from_receipt(&app, &token).await
 }

@@ -41,7 +41,7 @@ pub fn tmp_dir(app: &App) -> PathBuf {
 /// Where an upload goes and what it may be.
 pub struct Target {
     pub expires_at: Option<i64>,
-    /// Takes the expiry from the form's `expires_at` field (Unix seconds).
+    /// Takes the expiry from the form's `expires_in` field (seconds from now).
     pub expiry_from_form: bool,
     /// Largest original size accepted.
     pub max_bytes: Option<u64>,
@@ -108,19 +108,16 @@ pub async fn receive(
 ) -> Result<db::File, UploadError> {
     while let Some(field) = form.next_field().await? {
         match field.name() {
-            Some("expires_at") if target.expiry_from_form => {
+            Some("expires_in") if target.expiry_from_form => {
                 let text = field.text().await?;
                 let text = text.trim();
                 if !text.is_empty() {
-                    let at: i64 = text
+                    let secs: i64 = text
                         .parse()
-                        .map_err(|_| UploadError::BadRequest("Invalid expiry date.".into()))?;
-                    if at <= now() {
-                        return Err(UploadError::BadRequest(
-                            "The expiry date is in the past.".into(),
-                        ));
-                    }
-                    target.expires_at = Some(at);
+                        .ok()
+                        .filter(|s| *s > 0)
+                        .ok_or_else(|| UploadError::BadRequest("Invalid expiry.".into()))?;
+                    target.expires_at = Some(now().saturating_add(secs));
                 }
             }
             Some("file") => return store(app, field, &target).await,
@@ -198,6 +195,10 @@ async fn store(
         downloads: 0,
         deleted_at: None,
         invite: target.invite.clone(),
+        secret: None,
+        key_check: None,
+        receipt: None,
+        opened_at: None,
     };
     app.db.insert_file(&row)?;
     // Counted as used before the writer stops counting it as in flight.
@@ -331,8 +332,8 @@ pub async fn download(app: &App, id: &str, head: bool) -> Response {
         )
     };
     let f = match app.db.file(id) {
-        Ok(Some(f)) => f,
-        Ok(None) => {
+        Ok(Some(f)) if f.secret.is_none() => f,
+        Ok(_) => {
             return html::message(
                 StatusCode::NOT_FOUND,
                 "Not found",
@@ -434,11 +435,13 @@ pub async fn sweep(app: Arc<App>) {
             Ok(ids) => {
                 for id in &ids {
                     tracing::info!("{id} expired");
+                    app.db.add_event(id, "expired", "", "", "");
                     remove(&app, id).await;
                 }
             }
             Err(e) => tracing::error!("listing expired files: {e:#}"),
         }
+        crate::secret::sweep(&app).await;
         if let Err(e) = app.db.purge_sessions(now()) {
             tracing::error!("purging sessions: {e:#}");
         }

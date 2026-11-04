@@ -1,13 +1,39 @@
 # partage
 
-Share files through links. An admin logs in with one password, uploads files
-(optionally with an expiry date) and gets a link anyone can download from. The
-link never changes; once the file expires or is deleted, the link says so.
+Share files through links. An admin logs in with one password, drops files on
+the main page (optionally with an expiry) and gets a link anyone can download
+from. The link never changes; once the file expires or is deleted, the link
+says so.
+
+The main page is a drop zone with the space left above it. Several files give
+one link each; a **folder** is zipped in the browser (stored, not compressed,
+zip64 when needed) and gives one link. **Track** lists files, one-time secrets
+and upload links; **Settings** holds the storage limit and Discord alerts.
+
+* **One-time secrets**: tick *One-time secret* under the drop zone to send files
+  or a text that open **once**. They are encrypted in the browser
+  (AES-256-GCM, 1 MiB records); the key is only in the link's `#fragment`,
+  which browsers never send, so the server stores data it cannot read, not
+  even the file name. The link opens a page with a button: link previews
+  (Discord, Slack…) load the page but open nothing. Opening deletes the data
+  before the first byte is sent, so a cut-off download still counts as
+  opened. Files are decrypted by a service worker straight to disk (no size
+  limit; browsers without one hold the file in memory, and the page warns
+  above 500 MB). A damaged or truncated link is detected before opening.
+* **Receipts**: each secret has a receipt page, shown to whoever created it and
+  listed under Track. Its timeline shows when it was created, every view of
+  its page (with IP and browser, so previews show up), when it was opened,
+  whether the download finished or was interrupted, attempts after it was
+  gone, and expiry. **Burn** destroys a secret before it is opened, from the
+  receipt, the upload result, or Track.
 
 * **Upload links**: the admin creates a link someone else can use **once** to
-  upload one file, up to a size the admin chooses, until a date. The admin also
-  sets how long that file is kept (or forever). The person uploading gets the
-  download link, and the file shows up in the admin's list.
+  upload one file (or folder), up to a size the admin chooses, until a date.
+  The admin also sets how long that file is kept (or forever). The person
+  uploading gets the download link, and the file shows up under Track. A link
+  in **one-time secret** mode takes an encrypted file or text instead: the
+  person gets the one-time link to send on (the server never has its key) and
+  its receipt; the admin sees the receipt under Track.
 * **Storage limit**: the admin sets a total size for everything stored. When
   usage crosses **80%** and **90%**, an `@everyone` alert goes to a Discord
   webhook. An upload that would go **over 100%** is refused, with an alert at
@@ -34,7 +60,7 @@ facade env set partage PARTAGE_ADMIN_PASSWORD           # prompts; sensitive
 facade deploy partage
 ```
 
-Then log in at `https://files.example.com`, set the storage limit (10 GB until
+Then log in at `https://files.example.com`, open **Settings**, set the storage limit (10 GB until
 you do) and paste the Discord channel's webhook URL under **Discord alerts**;
 **Send test alert** checks it. Alerts wait until a webhook is set.
 
@@ -60,7 +86,10 @@ PARTAGE_ADMIN_PASSWORD=change-me-please cargo run    # http://localhost:8080
 
 | | |
 |---|---|
-| `/` | admin dashboard (redirects to `/login`) |
+| `/` | drop zone (redirects to `/login`) |
+| `/track`, `/settings` | admin pages |
 | `/f/{id}` | download a file |
 | `/u/{token}` | one-time upload page |
+| `/s/{id}#key` | open a one-time secret |
+| `/r/{token}` | a secret's receipt |
 | `/health` | `ok` |
