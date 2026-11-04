@@ -58,6 +58,9 @@ pub fn router(app: AppState) -> Router {
         .route("/r/{token}/burn", post(burn))
         .route("/f/{id}", get(download))
         .route("/health", get(|| async { "ok" }))
+        .route("/favicon.svg", get(icon_svg))
+        .route("/favicon.ico", get(icon_png))
+        .route("/apple-touch-icon.png", get(icon_png))
         .merge(uploads)
         .with_state(app)
 }
@@ -674,4 +677,28 @@ async fn receipt(
 
 async fn burn(State(app): State<AppState>, Path(token): Path<String>) -> Response {
     secret::burn_from_receipt(&app, &token).await
+}
+
+const ICON_CACHE: &str = "public, max-age=86400";
+
+async fn icon_svg() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, ICON_CACHE),
+        ],
+        html::ICON_SVG,
+    )
+        .into_response()
+}
+
+async fn icon_png() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, ICON_CACHE),
+        ],
+        html::ICON_PNG,
+    )
+        .into_response()
 }

@@ -12,6 +12,8 @@ const COMMON: &str = include_str!("assets/common.js");
 const CRYPTO: &str = include_str!("assets/crypto.js");
 const UPLOAD: &str = include_str!("assets/upload.js");
 const OPEN: &str = include_str!("assets/open.js");
+pub const ICON_SVG: &str = include_str!("assets/icon.svg");
+pub const ICON_PNG: &[u8] = include_bytes!("assets/apple-touch-icon.png");
 pub const SERVICE_WORKER: &str = concat!(
     include_str!("assets/crypto.js"),
     include_str!("assets/sw.js")
@@ -78,6 +80,8 @@ fn page(title: &str, body: &str, scripts: &[&str]) -> String {
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"robots\" content=\"noindex\">\
          <meta name=\"referrer\" content=\"no-referrer\">\
+         <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\
+         <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">\
          <title>{} · partage</title><style>{CSS}</style></head>\
          <body><main>{body}</main><script>{js}</script></body></html>",
         esc(title)
@@ -100,7 +104,7 @@ pub fn login(error: Option<&str>) -> String {
     page(
         "Log in",
         &format!(
-            "<section class=\"center\"><h2>partage</h2>\
+            "<section class=\"center\"><h2 class=\"brand\">{LOGO}partage</h2>\
              <form method=\"post\" action=\"/login\" class=\"row\">\
              <label style=\"flex:1\">Admin password\
              <input type=\"password\" name=\"password\" autofocus required autocomplete=\"current-password\"></label>\
@@ -110,21 +114,25 @@ pub fn login(error: Option<&str>) -> String {
     )
 }
 
-/// The admin pages' header: the name goes home, the buttons on the right.
+const LOGO: &str = "<img class=\"logo\" src=\"/favicon.svg\" alt=\"\" width=\"28\" height=\"28\">";
+
+/// The admin pages' header: the name goes home, the buttons on the right,
+/// with Upload first away from the drop zone.
 fn admin_header(current: &str) -> String {
-    let link = |href: &str, label: &str| {
+    let link = |href: &str, label: &str, class: &str| {
         if href == current {
             String::new()
         } else {
-            format!("<a class=\"button\" href=\"{href}\">{label}</a>")
+            format!("<a class=\"button{class}\" href=\"{href}\">{label}</a>")
         }
     };
     format!(
-        "<header><h1><a href=\"/\">partage</a></h1><nav>{}{}\
+        "<header><h1><a href=\"/\">{LOGO}partage</a></h1><nav>{}{}{}\
          <form method=\"post\" action=\"/logout\" class=\"inline\"><button class=\"plain\">Log out</button></form>\
          </nav></header>",
-        link("/track", "Track"),
-        link("/settings", "Settings"),
+        link("/", "↑ Upload", " primary"),
+        link("/track", "Track", ""),
+        link("/settings", "Settings", ""),
     )
 }
 
@@ -403,7 +411,7 @@ pub fn track(d: &Track) -> String {
          <label>&nbsp;<select name=\"valid_unit\"><option>hours</option><option selected>days</option></select></label>\
          <label>Keep file (days, empty: forever)<input type=\"number\" name=\"file_days\" min=\"0.01\" step=\"any\"></label>\
          <label title=\"Encrypted in their browser, opens once. They get the link to send back; you see its receipt here.\">\
-         One-time secret<input type=\"checkbox\" name=\"secret\" style=\"align-self:start\"></label>\
+         One-time secret<span class=\"checkbox-field\"><input type=\"checkbox\" name=\"secret\"></span></label>\
          <button>Create link</button></form>"
     );
     if !d.invites.is_empty() {

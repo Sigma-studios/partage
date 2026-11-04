@@ -66,3 +66,9 @@ textarea { font: 14px/1.4 ui-monospace, monospace; padding: 8px 10px; border: 1p
 .secret-box .warn { color: var(--warn); }
 .timeline td { font-size: 13px; }
 .timeline .agent { color: var(--muted); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+header h1 a, h2.brand { display: inline-flex; align-items: center; gap: 10px; }
+img.logo { border-radius: 7px; display: block; }
+/* A checkbox in a row of fields: as tall as an input, so the labels line up. */
+.checkbox-field { display: flex; align-items: center; height: calc(1.5em + 14px); }
+.checkbox-field input { margin: 0; width: 16px; height: 16px; }
