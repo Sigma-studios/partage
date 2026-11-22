@@ -1,4 +1,5 @@
-//! SQLite: files, upload links, sessions and settings.
+//! SQLite: files, upload links, sessions and settings. The Drive's tables
+//! are in `drive_db`.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -181,6 +182,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        crate::drive_db::migrate(&conn, crate::now())?;
         for (table, column, def) in ADDED {
             let exists: bool = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
@@ -203,7 +205,7 @@ impl Db {
         Ok(Self(Mutex::new(conn)))
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 

@@ -394,6 +394,11 @@ pub async fn download(app: &App, id: &str, head: bool) -> Response {
 
 /// `attachment`, with the name in ASCII for old clients and UTF-8 for the rest.
 fn content_disposition(name: &str) -> String {
+    disposition(name, false)
+}
+
+/// `inline` (shown by the browser) or `attachment` (saved), with the name.
+pub fn disposition(name: &str, inline: bool) -> String {
     let ascii: String = name
         .chars()
         .map(|c| {
@@ -412,7 +417,8 @@ fn content_disposition(name: &str) -> String {
             encoded.push_str(&format!("%{b:02X}"));
         }
     }
-    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+    let kind = if inline { "inline" } else { "attachment" };
+    format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
 /// Deletes a file's data; its link then says it expired.

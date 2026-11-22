@@ -49,8 +49,8 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// A date in UTC, replaced by the browser's local time by the page script.
-pub fn time(ts: i64) -> String {
+/// Year, month, day, hour, minute, second of a Unix time, in UTC.
+pub fn civil(ts: i64) -> (i64, i64, i64, i64, i64, i64) {
     let days = ts.div_euclid(86400);
     let secs = ts.rem_euclid(86400);
     // Howard Hinnant's civil_from_days.
@@ -63,14 +63,22 @@ pub fn time(ts: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
-    format!(
-        "<time data-ts=\"{ts}\">{y:04}-{m:02}-{d:02} {:02}:{:02} UTC</time>",
-        secs / 3600,
-        secs % 3600 / 60
-    )
+    (y, m, d, secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
-fn page(title: &str, body: &str, scripts: &[&str]) -> String {
+/// `2026-11-14T03:12:45Z`.
+pub fn rfc3339(ts: i64) -> String {
+    let (y, m, d, h, min, s) = civil(ts);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+}
+
+/// A date in UTC, replaced by the browser's local time by the page script.
+pub fn time(ts: i64) -> String {
+    let (y, m, d, h, min, _) = civil(ts);
+    format!("<time data-ts=\"{ts}\">{y:04}-{m:02}-{d:02} {h:02}:{min:02} UTC</time>")
+}
+
+pub(crate) fn page(title: &str, body: &str, scripts: &[&str]) -> String {
     let mut js = COMMON.to_string();
     for s in scripts {
         js += s;
@@ -114,11 +122,12 @@ pub fn login(error: Option<&str>) -> String {
     )
 }
 
-const LOGO: &str = "<img class=\"logo\" src=\"/favicon.svg\" alt=\"\" width=\"28\" height=\"28\">";
+pub(crate) const LOGO: &str =
+    "<img class=\"logo\" src=\"/favicon.svg\" alt=\"\" width=\"28\" height=\"28\">";
 
 /// The admin pages' header: the name goes home, the buttons on the right,
 /// with Upload first away from the drop zone.
-fn admin_header(current: &str) -> String {
+pub(crate) fn admin_header(current: &str) -> String {
     let link = |href: &str, label: &str, class: &str| {
         if href == current {
             String::new()
@@ -127,31 +136,32 @@ fn admin_header(current: &str) -> String {
         }
     };
     format!(
-        "<header><h1><a href=\"/\">{LOGO}partage</a></h1><nav>{}{}{}\
+        "<header><h1><a href=\"/\">{LOGO}partage</a></h1><nav>{}{}{}{}\
          <form method=\"post\" action=\"/logout\" class=\"inline\"><button class=\"plain\">Log out</button></form>\
          </nav></header>",
         link("/", "↑ Upload", " primary"),
+        link("/drive", "Drive", ""),
         link("/track", "Track", ""),
         link("/settings", "Settings", ""),
     )
 }
 
-fn flash_box(flash: Option<&str>) -> String {
+pub(crate) fn flash_box(flash: Option<&str>) -> String {
     flash
         .map(|f| format!("<div class=\"flash\">{}</div>", esc(f)))
         .unwrap_or_default()
 }
 
-fn copy_link(url: &str) -> String {
+pub(crate) fn copy_link(url: &str) -> String {
     let url = esc(url);
     format!("<button type=\"button\" class=\"plain\" data-copy=\"{url}\">Copy</button>")
 }
 
-fn percent(used: u64, limit: u64) -> f64 {
+pub(crate) fn percent(used: u64, limit: u64) -> f64 {
     used as f64 * 100.0 / limit.max(1) as f64
 }
 
-fn bar_class(percent: f64) -> &'static str {
+pub(crate) fn bar_class(percent: f64) -> &'static str {
     match percent {
         p if p >= 90.0 => "bar bad",
         p if p >= 80.0 => "bar warn",
@@ -221,13 +231,16 @@ pub fn home(used: u64, limit: u64) -> String {
     page("Upload", &body, &[CRYPTO, UPLOAD])
 }
 
-const SIZE_UNITS: &str = "<option>MB</option><option selected>GB</option><option>TB</option>";
+pub(crate) const SIZE_UNITS: &str =
+    "<option>MB</option><option selected>GB</option><option>TB</option>";
 
 pub struct Settings<'a> {
     pub flash: Option<&'a str>,
     pub used: u64,
     pub limit: u64,
     pub webhook: bool,
+    /// The Drive's section, rendered by `drive_html`.
+    pub drive: String,
 }
 
 pub fn settings(d: &Settings) -> String {
@@ -235,7 +248,7 @@ pub fn settings(d: &Settings) -> String {
     b += &flash_box(d.flash);
     let p = percent(d.used, d.limit);
     b += &format!(
-        "<section><h2>Storage</h2>\
+        "<section><h2>Storage for shared files</h2>\
          <div>{} of {} used ({p:.1}%)</div>\
          <div class=\"{}\"><div style=\"width:{:.1}%\"></div></div>\
          <p class=\"muted\">Counts files as stored, after compression. Uploads that would go over the limit are refused.</p>\
@@ -249,6 +262,7 @@ pub fn settings(d: &Settings) -> String {
         p.min(100.0),
         d.limit as f64 / 1e9,
     );
+    b += &d.drive;
     let (state, placeholder) = if d.webhook {
         (
             "A webhook is set: alerts go to its channel.",
@@ -262,7 +276,7 @@ pub fn settings(d: &Settings) -> String {
     };
     b += &format!(
         "<section><h2>Discord alerts</h2>\
-         <p class=\"muted\">Tags @everyone when storage passes 80% and 90%, and when an upload is blocked for lack of space. {state}</p>\
+         <p class=\"muted\">Tags @everyone when storage or the Drive passes 80% and 90%, when an upload is blocked for lack of space, and when the Drive's copies on the Storage Box need a look. {state}</p>\
          <div class=\"row\">\
          <form method=\"post\" action=\"/admin/webhook\" class=\"row\" style=\"flex:1\">\
          <label style=\"flex:1\">Webhook URL<input type=\"url\" name=\"url\" required placeholder=\"{placeholder}\"></label>\
@@ -286,6 +300,8 @@ pub struct Track<'a> {
     pub invites: &'a [db::Invite],
     /// Receipt tokens of the secrets sent through upload links, by file id.
     pub receipts: &'a HashMap<String, String>,
+    /// The Drive's share links, rendered by `drive_html`.
+    pub drive_links: String,
 }
 
 fn secret_kind(f: &db::File) -> &'static str {
@@ -472,6 +488,7 @@ pub fn track(d: &Track) -> String {
         b += "</table>";
     }
     b += "</section>";
+    b += &d.drive_links;
     page("Track", &b, &[])
 }
 

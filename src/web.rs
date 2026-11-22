@@ -62,6 +62,7 @@ pub fn router(app: AppState) -> Router {
         .route("/favicon.ico", get(icon_png))
         .route("/apple-touch-icon.png", get(icon_png))
         .merge(uploads)
+        .merge(crate::drive_web::router())
         .with_state(app)
 }
 
@@ -210,6 +211,9 @@ async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {
 #[derive(Deserialize)]
 struct Flash {
     msg: Option<String>,
+    /// Free-text messages from the Drive's settings.
+    err: Option<String>,
+    show_key: Option<String>,
 }
 
 /// Messages a redirect back to the settings can show.
@@ -256,11 +260,21 @@ async fn settings(
     State(app): State<AppState>,
     Query(flash): Query<Flash>,
 ) -> Html<String> {
+    let text: Option<String> = match (&flash.err, &flash.msg) {
+        (Some(e), _) => Some(e.chars().take(300).collect()),
+        (None, Some(m)) => Some(
+            flash_text(m)
+                .map(str::to_string)
+                .unwrap_or_else(|| m.chars().take(300).collect()),
+        ),
+        _ => None,
+    };
     Html(html::settings(&html::Settings {
-        flash: flash.msg.as_deref().and_then(flash_text),
+        flash: text.as_deref(),
         used: app.used(),
         limit: app.limit(),
         webhook: app.webhook().is_some(),
+        drive: crate::drive_web::settings_part(&app, flash.show_key.is_some()),
     }))
 }
 
@@ -290,6 +304,27 @@ async fn track(
         }
     }
     let base = base_url(&app, &headers);
+    let drive_links = match app.db.links(None) {
+        Ok(links) => {
+            let with_paths: Vec<_> = links
+                .into_iter()
+                .map(|l| {
+                    let path = app
+                        .db
+                        .ancestry(&l.node)
+                        .map(|p| {
+                            let names: Vec<&str> =
+                                p.iter().skip(1).map(|n| n.name.as_str()).collect();
+                            format!("/{}", names.join("/"))
+                        })
+                        .unwrap_or_default();
+                    (l, path)
+                })
+                .collect();
+            crate::drive_html::track_links(&base, &with_paths)
+        }
+        Err(e) => return internal(e),
+    };
     Html(html::track(&html::Track {
         base: &base,
         flash: flash.msg.as_deref().and_then(flash_text),
@@ -297,6 +332,7 @@ async fn track(
         secrets: &secrets,
         invites: &invites,
         receipts: &receipts,
+        drive_links,
     }))
     .into_response()
 }

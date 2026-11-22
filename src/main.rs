@@ -1,12 +1,22 @@
-//! partage: share files through links that do not change, and one-time
-//! secrets encrypted in the browser, with a storage limit and Discord
-//! alerts. See README.md.
+//! partage: share files through links that do not change, one-time secrets
+//! encrypted in the browser, and a Drive kept on a Storage Box (backed up by
+//! Réplique), with storage limits and Discord alerts. See README.md.
 
 mod alert;
+mod crypt;
 mod db;
+mod drive;
+mod drive_db;
+mod drive_html;
+mod drive_web;
 mod html;
+mod manifest;
+mod remote;
+mod replique;
+mod restore;
 mod secret;
 mod store;
+mod sync;
 mod web;
 
 use anyhow::{Context, bail};
@@ -72,6 +82,7 @@ pub struct App {
     login_failures: Mutex<HashMap<String, (u32, Instant)>>,
     /// One-time secrets being uploaded.
     uploads: secret::Uploads,
+    drive: drive::Drive,
 }
 
 impl App {
@@ -137,8 +148,10 @@ async fn shutdown() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        return healthcheck();
+    match std::env::args().nth(1).as_deref() {
+        Some("healthcheck") => return healthcheck(),
+        Some("drive-restore") => return restore::main(std::env::args().skip(2).collect()),
+        _ => {}
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -158,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_LIMIT);
     let webhook = db.setting("discord_webhook")?;
+    let drive = drive::Drive::open(&cfg.data, &db)?;
     let addr = cfg.addr.clone();
     let app = Arc::new(App {
         cfg,
@@ -173,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         last_blocked_alert: Default::default(),
         login_failures: Default::default(),
         uploads: Default::default(),
+        drive,
     });
     app.refresh_usage();
     tracing::info!(
@@ -182,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         app.cfg.data.display()
     );
     tokio::spawn(store::sweep(app.clone()));
+    tokio::spawn(sync::run(app.clone()));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

@@ -45,7 +45,17 @@ and upload links; **Settings** holds the storage limit and Discord alerts.
 * No size limit apart from the storage limit. Uploads and downloads are
   streamed, so memory use stays flat.
 
-Data (SQLite database and files) lives in `PARTAGE_DATA`.
+* **Drive**: folders of files kept on a Hetzner Storage Box, encrypted, with
+  the server keeping copies while they fit in the space allowed for them.
+  Folders dropped whole keep their tree; a file dropped again becomes a new
+  version; deleted items go to a trash for 30 days. Any file or folder can be
+  shared by link: download, read, read and add, read, add and delete, or add
+  only, with an optional expiry; links that add need a size limit on the
+  folder. Paired with [Réplique](https://github.com/Sigma-studios/replique),
+  the Storage Box account is created for it, partage reports to it, and the
+  PC keeps a verified copy. See [docs/drive.md](docs/drive.md).
+
+Data (SQLite database, files, the Drive's key and SSH key) lives in `PARTAGE_DATA`.
 
 ## Deploying on facade
 
@@ -63,6 +73,24 @@ facade deploy partage
 Then log in at `https://files.example.com`, open **Settings**, set the storage limit (10 GB until
 you do) and paste the Discord channel's webhook URL under **Discord alerts**;
 **Send test alert** checks it. Alerts wait until a webhook is set.
+
+For the Drive, under **Settings → Drive**: set the Drive's limit and how much it
+may keep on the server, pair with Réplique (add a device of kind *partage* on
+Réplique's website and paste its pairing code; or connect any SFTP account by
+hand), and save the **Drive key** in a password manager. Without the key,
+neither the Storage Box nor the PC's copy can be read.
+
+### Getting the Drive back without partage
+
+```sh
+PARTAGE_DRIVE_KEY=… partage drive-restore /path/to/copy --list      # manifests
+PARTAGE_DRIVE_KEY=… partage drive-restore /path/to/copy restored/   # newest tree
+PARTAGE_DRIVE_KEY=… partage drive-restore /path/to/copy restored/ --at 2026-11-20 --trash
+```
+
+`/path/to/copy` holds `objects/` and `manifests/`: the PC's mirror folder, or the
+box's folder fetched with any SFTP client. Every file is checked against its
+checksum; the formats are in [docs/drive-format.md](docs/drive-format.md).
 
 | variable | default | |
 |---|---|---|
@@ -88,6 +116,8 @@ PARTAGE_ADMIN_PASSWORD=change-me-please cargo run    # http://localhost:8080
 |---|---|
 | `/` | drop zone (redirects to `/login`) |
 | `/track`, `/settings` | admin pages |
+| `/drive`, `/drive/item/{id}`, `/drive/trash` | the Drive (admin) |
+| `/d/{token}` | a Drive share link |
 | `/f/{id}` | download a file |
 | `/u/{token}` | one-time upload page |
 | `/s/{id}#key` | open a one-time secret |
