@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS replique_spool (
 
 pub fn migrate(conn: &Connection, now: i64) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    let has_crc: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('drive_versions') WHERE name = 'crc32'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_crc {
+        conn.execute("ALTER TABLE drive_versions ADD COLUMN crc32 INTEGER", [])?;
+    }
     conn.execute(
         "INSERT OR IGNORE INTO drive_nodes (id, parent, name, dir, created_at, modified_at) \
          VALUES (?, NULL, '', 1, ?, ?)",
@@ -220,6 +228,8 @@ pub struct Version {
     pub created_at: i64,
     pub replaced_at: Option<i64>,
     pub added_by: String,
+    /// For zip downloads; computed on first need for versions older than it.
+    pub crc32: Option<u32>,
 }
 
 fn version(r: &Row) -> rusqlite::Result<Version> {
@@ -233,11 +243,12 @@ fn version(r: &Row) -> rusqlite::Result<Version> {
         created_at: r.get(6)?,
         replaced_at: r.get(7)?,
         added_by: r.get(8)?,
+        crc32: r.get(9)?,
     })
 }
 
 const VERSION_COLS: &str =
-    "id, node, object, size, sha256, content_type, created_at, replaced_at, added_by";
+    "id, node, object, size, sha256, content_type, created_at, replaced_at, added_by, crc32";
 
 /// The first and last manifests (by time) that listed an object.
 pub type Span = (i64, i64);
@@ -267,6 +278,8 @@ pub struct NewFile<'a> {
     pub sealed: u64,
     pub size: u64,
     pub sha256: &'a str,
+    /// CRC-32 of the file, for zip downloads.
+    pub crc32: u32,
     pub content_type: &'a str,
     /// Where the object is.
     pub local: bool,
@@ -462,7 +475,7 @@ impl Db {
         };
         tx.execute(
             &format!(
-                "INSERT INTO drive_versions ({VERSION_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+                "INSERT INTO drive_versions ({VERSION_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)"
             ),
             params![
                 version,
@@ -472,7 +485,8 @@ impl Db {
                 f.sha256,
                 f.content_type,
                 f.now,
-                f.added_by
+                f.added_by,
+                f.crc32
             ],
         )?;
         touch_parent(&tx, f.parent, f.now)?;
@@ -692,6 +706,37 @@ impl Db {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn set_crc32(&self, version: &str, crc: u32) -> Result<()> {
+        self.conn().execute(
+            "UPDATE drive_versions SET crc32 = ? WHERE id = ?",
+            params![crc, version],
+        )?;
+        Ok(())
+    }
+
+    /// Every file and folder under `id` (trash excluded), with its path
+    /// below `id`, folders before what they hold.
+    pub fn tree(&self, id: &str) -> Result<Vec<(String, Node)>> {
+        let mut out = Vec::new();
+        let mut stack = vec![(String::new(), id.to_string())];
+        while let Some((prefix, dir)) = stack.pop() {
+            let children = self.children(&dir)?;
+            // Reversed, so the stack pops them in name order.
+            for n in children.into_iter().rev() {
+                let path = format!("{prefix}{}", n.name);
+                if n.dir {
+                    stack.push((format!("{path}/"), n.id.clone()));
+                }
+                out.push((path, n));
+            }
+            if out.len() > 1_000_000 {
+                bail!("too many files");
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     pub fn version(&self, id: &str) -> Result<Option<Version>> {
         Ok(self
             .conn()
@@ -721,7 +766,7 @@ impl Db {
         let id = crate::token(16);
         tx.execute(
             &format!(
-                "INSERT INTO drive_versions ({VERSION_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+                "INSERT INTO drive_versions ({VERSION_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)"
             ),
             params![
                 id,
@@ -731,7 +776,8 @@ impl Db {
                 v.sha256,
                 v.content_type,
                 now,
-                "admin"
+                "admin",
+                v.crc32
             ],
         )?;
         tx.execute(
@@ -1023,6 +1069,7 @@ mod tests {
             sealed: 100,
             size: 44,
             sha256: "x",
+            crc32: 0,
             content_type: "text/plain",
             local: true,
             remote: false,

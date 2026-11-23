@@ -9,6 +9,7 @@ anyhow = "1.0.104"
 async-compression = { version = "0.4.51", features = ["tokio", "zstd"] }
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
+crc32fast = "1"
 futures-util = "0.3.34"
 hkdf = "0.12"
 rand = "0.9"

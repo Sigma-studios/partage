@@ -448,6 +448,7 @@ pub async fn sweep(app: Arc<App>) {
             Err(e) => tracing::error!("listing expired files: {e:#}"),
         }
         crate::secret::sweep(&app).await;
+        crate::drive::sweep_sessions(&app).await;
         if let Err(e) = app.db.purge_sessions(now()) {
             tracing::error!("purging sessions: {e:#}");
         }

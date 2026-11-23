@@ -1798,6 +1798,7 @@ dependencies = [
  "async-compression",
  "axum",
  "base64 0.22.1",
+ "crc32fast",
  "futures-util",
  "hkdf 0.12.4",
  "rand 0.9.5",

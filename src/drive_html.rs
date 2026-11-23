@@ -4,8 +4,7 @@
 use crate::{
     drive_db::{Link, Mode, Node, ROOT, Version},
     html::{
-        LOGO, admin_header, bar_class, copy_link, esc, flash_box, fmt_bytes, page,
-        percent, time,
+        LOGO, admin_header, bar_class, copy_link, esc, flash_box, fmt_bytes, page, percent, time,
     },
     now,
 };
@@ -120,17 +119,18 @@ pub fn folder(d: &Folder) -> String {
     b += &format!(
         "<section id=\"drive\" class=\"drive\" data-base=\"/drive\" data-folder=\"{}\" data-reload=\"1\">\
          <div class=\"drive-head\">{}<div class=\"row\">\
-         <a class=\"button\" href=\"/drive/item/{}\">Share{}</a>\
+         <a class=\"button\" href=\"/drive/zip/{id}\" download>Download as zip</a>\
+         <a class=\"button\" href=\"/drive/item/{id}\">Share{}</a>\
          <a class=\"button\" href=\"/drive/trash\">Trash</a></div></div>{}",
         esc(&here.id),
         crumbs(d.path, |n| folder_href(&n.id), "Drive"),
-        esc(&here.id),
         if here.id == ROOT {
             ""
         } else {
             " or edit this folder"
         },
         upload_tools(true),
+        id = esc(&here.id),
     );
     b += &listing(
         d.children,
@@ -545,9 +545,17 @@ pub fn shared_folder(d: &Shared) -> String {
         Some(e) => format!(" This link works until {}.", time(e)),
         None => String::new(),
     };
+    let zip = if mode.can_read() {
+        format!(
+            "<a class=\"button\" href=\"/d/{t}/zip?f={}\" download>Download as zip</a>",
+            esc(&here.id)
+        )
+    } else {
+        String::new()
+    };
     b += &format!(
         "<section id=\"drive\" class=\"drive\" data-base=\"/d/{t}\" data-folder=\"{}\" data-reload=\"{}\">\
-         <div class=\"drive-head\">{}</div><p class=\"muted\">{what}{room}{expiry}</p>",
+         <div class=\"drive-head\">{}{zip}</div><p class=\"muted\">{what}{room}{expiry}</p>",
         esc(&here.id),
         if mode.can_read() { "1" } else { "" },
         if mode.can_read() {

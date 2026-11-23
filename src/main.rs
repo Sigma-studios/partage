@@ -2,12 +2,16 @@
 //! encrypted in the browser, and a Drive kept on a Storage Box (backed up by
 //! Réplique), with storage limits and Discord alerts. See README.md.
 
+// Handlers return a ready response as their error, axum's way.
+#![allow(clippy::result_large_err)]
+
 mod alert;
 mod crypt;
 mod db;
 mod drive;
 mod drive_db;
 mod drive_html;
+mod drive_transfer;
 mod drive_web;
 mod html;
 mod manifest;
@@ -18,6 +22,7 @@ mod secret;
 mod store;
 mod sync;
 mod web;
+mod zip;
 
 use anyhow::{Context, bail};
 use rand::{Rng, distr::Alphanumeric};
@@ -136,6 +141,25 @@ fn healthcheck() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `partage drive-pair <réplique url> <code>`: pairs the Drive with Réplique
+/// from a shell (`facade exec partage partage drive-pair …`), like Settings →
+/// Drive → With Réplique. The running server picks the new box up within a
+/// minute.
+async fn drive_pair(app: &Arc<App>) -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let [url, code] = &args[..] else {
+        bail!("usage: partage drive-pair <réplique url> <pairing code>");
+    };
+    let cfg = replique::pair(app, url, code).await?;
+    println!("paired: Storage Box {}", cfg.label());
+    drive_web::connect(app, cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("the Storage Box refused partage: {e}"))?;
+    replique::declare_job(app).await;
+    println!("the Drive now copies to the Storage Box; Réplique hears about it");
+    Ok(())
+}
+
 async fn shutdown() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
@@ -151,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("healthcheck") => return healthcheck(),
         Some("drive-restore") => return restore::main(std::env::args().skip(2).collect()),
+        Some("drive-pair") => {}
         _ => {}
     }
     tracing_subscriber::fmt()
@@ -162,8 +187,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     std::fs::create_dir_all(cfg.data.join("files"))
         .with_context(|| format!("creating {}", cfg.data.display()))?;
-    // Leftovers of uploads cut off by a restart.
-    let _ = std::fs::remove_dir_all(cfg.data.join("tmp"));
+    // Leftovers of uploads cut off by a restart (not when a command runs
+    // beside the server, whose uploads they are).
+    if std::env::args().nth(1).is_none() {
+        let _ = std::fs::remove_dir_all(cfg.data.join("tmp"));
+    }
     std::fs::create_dir_all(cfg.data.join("tmp"))?;
     let db = db::Db::open(&cfg.data.join("partage.db"))?;
     let limit = db
@@ -190,6 +218,9 @@ async fn main() -> anyhow::Result<()> {
         drive,
     });
     app.refresh_usage();
+    if std::env::args().nth(1).as_deref() == Some("drive-pair") {
+        return drive_pair(&app).await;
+    }
     tracing::info!(
         "{} of {} used, data in {}",
         html::fmt_bytes(app.used()),

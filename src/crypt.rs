@@ -181,11 +181,6 @@ impl Sealer {
         self.index += 1;
     }
 
-    /// Bytes of the file pushed so far.
-    pub fn plain_len(&self) -> u64 {
-        self.plain
-    }
-
     /// Seals the last record and returns the object's name.
     pub fn finish(mut self, out: &mut Vec<u8>) -> String {
         self.seal(true, out);

@@ -55,6 +55,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/drive/sync", post(sync_now))
         .route("/admin/drive/check", post(check_now))
         .merge(uploads)
+        .merge(crate::drive_transfer::router())
 }
 
 /// Requests from the page's script get plain text; forms get a redirect
@@ -91,7 +92,7 @@ fn failed(headers: &HeaderMap, back: &str, err: &str) -> Response {
     Redirect::to(&format!("{back}{sep}err={}", enc(err))).into_response()
 }
 
-fn internal(e: anyhow::Error) -> Response {
+pub(crate) fn internal(e: anyhow::Error) -> Response {
     tracing::error!("drive: {e:#}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -130,11 +131,11 @@ fn folder_href(id: &str) -> String {
 }
 
 /// A live (not trashed) node.
-fn live(app: &App, id: &str) -> anyhow::Result<Option<Node>> {
+pub(crate) fn live(app: &App, id: &str) -> anyhow::Result<Option<Node>> {
     Ok(app.db.node(id)?.filter(|n| n.trashed_at.is_none()))
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     crate::html::message(
         StatusCode::NOT_FOUND,
         "Not found",
@@ -318,7 +319,7 @@ struct UploadQuery {
     size: u64,
 }
 
-fn content_type(headers: &HeaderMap) -> String {
+pub(crate) fn content_type(headers: &HeaderMap) -> String {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
@@ -651,7 +652,7 @@ async fn revoke(
 
 // Share links.
 
-fn link_gone() -> Response {
+pub(crate) fn link_gone() -> Response {
     crate::html::message(
         StatusCode::GONE,
         "Link not usable",
@@ -661,7 +662,7 @@ fn link_gone() -> Response {
 
 /// The link and the item it shares, if it can still be used.
 #[allow(clippy::result_large_err)]
-fn resolve(app: &App, token: &str) -> Result<(Link, Node), Response> {
+pub(crate) fn resolve(app: &App, token: &str) -> Result<(Link, Node), Response> {
     let link = match app.db.link(token) {
         Ok(Some(l)) if l.usable(now()) => l,
         Ok(_) => return Err(link_gone()),
@@ -676,7 +677,7 @@ fn resolve(app: &App, token: &str) -> Result<(Link, Node), Response> {
 
 /// A folder the link reaches: its own, or one under it.
 #[allow(clippy::result_large_err)]
-fn reachable(app: &App, root: &Node, id: Option<&str>) -> Result<Node, Response> {
+pub(crate) fn reachable(app: &App, root: &Node, id: Option<&str>) -> Result<Node, Response> {
     let Some(id) = id.filter(|i| *i != root.id) else {
         return Ok(root.clone());
     };
@@ -696,7 +697,7 @@ fn reachable(app: &App, root: &Node, id: Option<&str>) -> Result<Node, Response>
 
 /// Room left under the tightest limit between the link's folder and the
 /// root, and that limit.
-fn room(app: &App, folder: &Node) -> anyhow::Result<Option<(u64, u64)>> {
+pub(crate) fn room(app: &App, folder: &Node) -> anyhow::Result<Option<(u64, u64)>> {
     let mut best: Option<(u64, u64)> = None;
     for a in app.db.ancestry(&folder.id)? {
         if let Some(limit) = a.limit_bytes {
@@ -817,7 +818,7 @@ async fn link_file(
     .await
 }
 
-fn link_actor(link: &Link) -> String {
+pub(crate) fn link_actor(link: &Link) -> String {
     let who = if link.note.is_empty() {
         &link.token[..8.min(link.token.len())]
     } else {
@@ -967,7 +968,7 @@ struct PairForm {
 }
 
 /// Tries a configuration and keeps it if partage can write there.
-async fn connect(app: &Arc<App>, cfg: BoxConfig) -> Result<(), String> {
+pub(crate) async fn connect(app: &Arc<App>, cfg: BoxConfig) -> Result<(), String> {
     let remote = crate::remote::Remote::new(cfg.clone(), app.drive.ssh_key.clone());
     if let Err(e) = remote.prepare().await {
         return Err(format!("{e:#}"));

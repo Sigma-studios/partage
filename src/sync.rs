@@ -44,6 +44,7 @@ pub async fn run(app: Arc<App>) {
             _ = app.drive.wake.notified() => {}
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
         }
+        reload_box(&app);
         replique::replay_spool(&app).await;
         evict(&app).await;
         let Some(remote) = app.drive.remote() else {
@@ -162,6 +163,31 @@ async fn session(
         run.error(format!("{e:#}"));
     }
     result
+}
+
+/// Picks up box settings saved by another process (`partage drive-pair`).
+fn reload_box(app: &App) {
+    let saved: Option<crate::remote::BoxConfig> = app
+        .db
+        .setting("drive_box")
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok());
+    let current = app.drive.remote().map(|r| r.cfg.clone());
+    // The host key filled in after the first connection is not a change.
+    let differs = match (&saved, &current) {
+        (Some(a), Some(b)) => {
+            (&a.host, a.port, &a.user, &a.path) != (&b.host, b.port, &b.user, &b.path)
+        }
+        (None, None) => false,
+        _ => true,
+    };
+    if differs {
+        tracing::info!("drive: Storage Box settings changed, using them");
+        if let Err(e) = crate::drive::set_box(app, saved) {
+            tracing::error!("drive: {e:#}");
+        }
+    }
 }
 
 fn remember_host_key(app: &App, remote: &Remote) {

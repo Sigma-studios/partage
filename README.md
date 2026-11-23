@@ -51,7 +51,8 @@ and upload links; **Settings** holds the storage limit and Discord alerts.
   version; deleted items go to a trash for 30 days. Any file or folder can be
   shared by link: download, read, read and add, read, add and delete, or add
   only, with an optional expiry; links that add need a size limit on the
-  folder. Paired with [Réplique](https://github.com/Sigma-studios/replique),
+  folder. Folders download as one zip; uploads and downloads resume after a
+  dropped connection. Paired with [Réplique](https://github.com/Sigma-studios/replique),
   the Storage Box account is created for it, partage reports to it, and the
   PC keeps a verified copy. See [docs/drive.md](docs/drive.md).
 
@@ -77,7 +78,8 @@ you do) and paste the Discord channel's webhook URL under **Discord alerts**;
 For the Drive, under **Settings → Drive**: set the Drive's limit and how much it
 may keep on the server, pair with Réplique (add a device of kind *partage* on
 Réplique's website and paste its pairing code; or connect any SFTP account by
-hand), and save the **Drive key** in a password manager. Without the key,
+hand; or from a shell, `partage drive-pair <réplique url> <code>`), and save
+the **Drive key** in a password manager. Without the key,
 neither the Storage Box nor the PC's copy can be read.
 
 ### Getting the Drive back without partage
@@ -118,6 +120,8 @@ PARTAGE_ADMIN_PASSWORD=change-me-please cargo run    # http://localhost:8080
 | `/track`, `/settings` | admin pages |
 | `/drive`, `/drive/item/{id}`, `/drive/trash` | the Drive (admin) |
 | `/d/{token}` | a Drive share link |
+| `/drive/uploads`, `/d/{token}/uploads` | resumable uploads (start, then `PUT …/{id}?offset=N`) |
+| `/drive/zip/{id}`, `/d/{token}/zip` | a folder as a zip |
 | `/f/{id}` | download a file |
 | `/u/{token}` | one-time upload page |
 | `/s/{id}#key` | open a one-time secret |

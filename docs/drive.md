@@ -90,10 +90,33 @@ noticed), uploads straight to the box as runs too, and each daily check as a
 mirror job copies the store; see Réplique's docs/client.md, "Mirroring
 partage".
 
+## Uploads and downloads that survive a bad connection
+
+* **Uploads** go in pieces of 16 MiB: the page starts an upload (the space is
+  held from then on), then sends `PUT …/uploads/{id}?offset=N`. A piece cut
+  off still counts what arrived; the page asks how much did and goes on from
+  there, after a pause that grows (up to 30 seconds), and at once when the
+  browser comes back online. An upload nobody continues for a day is dropped,
+  and so is every unfinished upload when partage restarts: the page then sends
+  that file again from the start.
+* **Downloads** of files and of folder zips answer ranges, with an ETag, so a
+  browser or `curl -C -` resumes where it stopped (and starts over if the file or
+  folder changed meanwhile).
+* **Folder zips** (Download as zip, for the admin and for links that can read)
+  are built on the fly. Files are stored as they are, with the CRC-32 kept from
+  their upload, so the whole zip is known before it is sent: it has a length,
+  any range of it can be served, and zip64 takes over past 4 GB or 65,535
+  entries.
+
+## From a shell
+
+`partage drive-pair <réplique url> <code>` pairs the Drive with Réplique like
+Settings → Drive → With Réplique (`facade exec partage partage drive-pair …`);
+the running server picks the new box up within a minute.
+
 ## Not done yet
 
-* Downloading a folder as one zip.
 * Rebuilding the database from the newest manifest (`drive-restore` writes the
   files out; a new partage would start from an empty Drive).
-* Resumable uploads for very large files.
+* Moving to another Storage Box: objects only on the old one are not copied over.
 * The existing drop zone's files and one-time secrets stay on the VPS.

@@ -59,6 +59,8 @@ pub struct Drive {
     pub inflight: AtomicU64,
     /// Uploads in progress through links: the folders they count against.
     pending: Mutex<HashMap<u64, (Vec<String>, u64)>>,
+    /// Uploads that can be continued, by id.
+    sessions: Mutex<HashMap<String, Shared>>,
     pub runs: replique::Runs,
     pub status: Mutex<Status>,
 }
@@ -98,6 +100,7 @@ impl Drive {
             local_limit: AtomicU64::new(setting("drive_local_limit", DEFAULT_LOCAL_LIMIT)),
             inflight: AtomicU64::new(0),
             pending: Default::default(),
+            sessions: Default::default(),
             runs: Default::default(),
             status: Default::default(),
         })
@@ -169,22 +172,28 @@ impl From<std::io::Error> for DriveError {
     }
 }
 
-impl IntoResponse for DriveError {
-    fn into_response(self) -> Response {
+impl DriveError {
+    /// The status and the message for the person uploading.
+    pub fn parts(self) -> (StatusCode, String) {
         match self {
-            Self::Bad(m) => (StatusCode::BAD_REQUEST, m).into_response(),
-            Self::Full(m) => (StatusCode::INSUFFICIENT_STORAGE, m).into_response(),
-            Self::Gone(m) => (StatusCode::GONE, m).into_response(),
-            Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
+            Self::Bad(m) => (StatusCode::BAD_REQUEST, m),
+            Self::Full(m) => (StatusCode::INSUFFICIENT_STORAGE, m),
+            Self::Gone(m) => (StatusCode::GONE, m),
+            Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::Internal(e) => {
                 tracing::error!("drive: {e:#}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Something went wrong on the server.",
+                    "Something went wrong on the server.".into(),
                 )
-                    .into_response()
             }
         }
+    }
+}
+
+impl IntoResponse for DriveError {
+    fn into_response(self) -> Response {
+        self.parts().into_response()
     }
 }
 
@@ -206,13 +215,13 @@ pub struct Upload {
 }
 
 /// Removes an upload from the counts when it ends, however it ends.
-struct InFlight<'a> {
-    app: &'a App,
+struct InFlight {
+    app: Arc<App>,
     sealed: u64,
     id: u64,
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
     fn drop(&mut self) {
         self.app.drive.inflight.fetch_sub(self.sealed, Relaxed);
         self.app.drive.pending.lock().unwrap().remove(&self.id);
@@ -243,180 +252,338 @@ impl Sink {
     }
 }
 
-pub async fn receive(app: &Arc<App>, up: Upload, body: Body) -> Result<Node, DriveError> {
-    let Some(folder) = app.db.node(&up.folder)? else {
-        return Err(DriveError::Gone("That folder no longer exists.".into()));
-    };
-    if !folder.dir || folder.trashed_at.is_some() {
-        return Err(DriveError::Gone("That folder no longer exists.".into()));
-    }
-    let mut parts = Vec::new();
-    for p in up.path.split('/').filter(|p| !p.is_empty()) {
-        parts.push(check_name(p).map_err(DriveError::Bad)?);
-    }
-    let Some(name) = parts.pop() else {
-        return Err(DriveError::Bad("The file has no name.".into()));
-    };
-    let sealed = crypt::sealed_size(up.size);
-    let d = &app.drive;
+/// How long an upload waits for its next piece before it is dropped.
+pub const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How long a piece may stall before its request gives up (the upload stays,
+/// to be resumed).
+const PIECE_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
-    // The box's limit, counting uploads in progress.
-    let box_used = app.db.box_bytes()? + d.inflight.load(Relaxed);
-    if box_used + sealed > d.box_limit() {
-        alert::drive_blocked(app.clone());
-        return Err(DriveError::Full(format!(
-            "The Drive is full: {} of {} used.",
-            html::fmt_bytes(box_used),
-            html::fmt_bytes(d.box_limit())
-        )));
-    }
-    let ancestry = app.db.ancestry(&folder.id)?;
-    if up.limited {
-        let pending = d.pending.lock().unwrap();
-        for a in ancestry.iter().filter(|a| a.limit_bytes.is_some()) {
-            let limit = a.limit_bytes.unwrap_or(0);
-            let busy: u64 = pending
-                .values()
-                .filter(|(folders, _)| folders.contains(&a.id))
-                .map(|(_, n)| n)
-                .sum();
-            let used = app.db.tree_size(&a.id)? + busy;
-            if used + up.size > limit {
-                return Err(DriveError::Full(format!(
-                    "Not enough room in this folder: {} of {} used, {} left.",
-                    html::fmt_bytes(used),
-                    html::fmt_bytes(limit),
-                    html::fmt_bytes(limit.saturating_sub(used))
-                )));
-            }
-        }
-    }
-    let id = rand::random();
-    d.pending.lock().unwrap().insert(
-        id,
-        (ancestry.iter().map(|a| a.id.clone()).collect(), up.size),
-    );
-    d.inflight.fetch_add(sealed, Relaxed);
-    let _inflight = InFlight { app, sealed, id };
+/// An upload in progress: the space is held for it, its object is being
+/// sealed into its sink, and it can be continued piece by piece from where
+/// it stopped (`received`) until it is whole.
+pub struct Session {
+    app: Arc<App>,
+    /// `admin`, or `link:<token>`: only who started it may continue it.
+    pub owner: String,
+    up: Upload,
+    folder: String,
+    parts: Vec<String>,
+    name: String,
+    sealed: u64,
+    sink: Option<Sink>,
+    sealer: Option<Sealer>,
+    out: Vec<u8>,
+    plain_hash: Sha256,
+    crc: crc32fast::Hasher,
+    pub received: u64,
+    pub last_seen: Instant,
+    remote: Option<Arc<Remote>>,
+    _inflight: InFlight,
+    run: Option<replique::RunGuard>,
+}
 
-    // Here while it fits, counting what is not on the box yet; otherwise
-    // straight to the box.
-    let remote = d.remote();
-    let (_, unsynced) = app.db.local_bytes()?;
-    let fits_here = unsynced + sealed <= d.local_limit();
-    let (mut sink, _run) = match (&remote, fits_here) {
-        (_, true) => {
-            let tmp = crate::store::tmp_dir(app).join(crate::token(16));
-            (Sink::Local(tokio::fs::File::create(&tmp).await?, tmp), None)
+impl Session {
+    pub fn size(&self) -> u64 {
+        self.up.size
+    }
+
+    /// Checks the names and the space, holds the space, and opens where the
+    /// object goes.
+    pub async fn start(app: &Arc<App>, up: Upload, owner: String) -> Result<Session, DriveError> {
+        let Some(folder) = app.db.node(&up.folder)? else {
+            return Err(DriveError::Gone("That folder no longer exists.".into()));
+        };
+        if !folder.dir || folder.trashed_at.is_some() {
+            return Err(DriveError::Gone("That folder no longer exists.".into()));
         }
-        (Some(r), false) => {
-            let run = replique::begin(app);
-            match r.writer().await {
-                Ok(w) => (Sink::Remote(Box::new(w)), Some(run)),
-                Err(e) => {
-                    d.error(format!("the Storage Box is unreachable: {e:#}"));
-                    return Err(DriveError::Unavailable(
-                        "This file is too big for the server and the Storage Box cannot be reached right now: try again later.".into(),
-                    ));
+        let mut parts = Vec::new();
+        for p in up.path.split('/').filter(|p| !p.is_empty()) {
+            parts.push(check_name(p).map_err(DriveError::Bad)?);
+        }
+        let Some(name) = parts.pop() else {
+            return Err(DriveError::Bad("The file has no name.".into()));
+        };
+        let sealed = crypt::sealed_size(up.size);
+        let d = &app.drive;
+
+        // The box's limit, counting uploads in progress.
+        let box_used = app.db.box_bytes()? + d.inflight.load(Relaxed);
+        if box_used + sealed > d.box_limit() {
+            alert::drive_blocked(app.clone());
+            return Err(DriveError::Full(format!(
+                "The Drive is full: {} of {} used.",
+                html::fmt_bytes(box_used),
+                html::fmt_bytes(d.box_limit())
+            )));
+        }
+        let ancestry = app.db.ancestry(&folder.id)?;
+        if up.limited {
+            let pending = d.pending.lock().unwrap();
+            for a in ancestry.iter().filter(|a| a.limit_bytes.is_some()) {
+                let limit = a.limit_bytes.unwrap_or(0);
+                let busy: u64 = pending
+                    .values()
+                    .filter(|(folders, _)| folders.contains(&a.id))
+                    .map(|(_, n)| n)
+                    .sum();
+                let used = app.db.tree_size(&a.id)? + busy;
+                if used + up.size > limit {
+                    return Err(DriveError::Full(format!(
+                        "Not enough room in this folder: {} of {} used, {} left.",
+                        html::fmt_bytes(used),
+                        html::fmt_bytes(limit),
+                        html::fmt_bytes(limit.saturating_sub(used))
+                    )));
                 }
             }
         }
-        (None, false) => {
-            return Err(DriveError::Full(format!(
-                "Without a Storage Box, the Drive keeps files on this server only, and this one does not fit in the {} allowed for it.",
-                html::fmt_bytes(d.local_limit())
-            )));
-        }
-    };
+        let id = rand::random();
+        d.pending.lock().unwrap().insert(
+            id,
+            (ancestry.iter().map(|a| a.id.clone()).collect(), up.size),
+        );
+        d.inflight.fetch_add(sealed, Relaxed);
+        let inflight = InFlight {
+            app: app.clone(),
+            sealed,
+            id,
+        };
 
-    let mut sealer_out = Vec::with_capacity(2 << 20);
-    let mut sealer = Sealer::new(&d.key, &mut sealer_out);
-    let mut plain_hash = Sha256::new();
-    let mut stream = body.into_data_stream();
-    let result: Result<(), DriveError> = async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| DriveError::Bad(format!("upload interrupted: {e}")))?;
-            if sealer.plain_len() + chunk.len() as u64 > up.size {
-                return Err(DriveError::Bad("The file is bigger than announced.".into()));
+        // Here while it fits, counting what is not on the box yet; otherwise
+        // straight to the box.
+        let remote = d.remote();
+        let (_, unsynced) = app.db.local_bytes()?;
+        let fits_here = unsynced + sealed <= d.local_limit();
+        let (sink, run) = match (&remote, fits_here) {
+            (_, true) => {
+                let tmp = crate::store::tmp_dir(app).join(crate::token(16));
+                (Sink::Local(tokio::fs::File::create(&tmp).await?, tmp), None)
             }
-            plain_hash.update(&chunk);
-            sealer.push(&chunk, &mut sealer_out);
-            if sealer_out.len() >= 1 << 20 {
-                sink.write(&sealer_out).await?;
-                sealer_out.clear();
+            (Some(r), false) => {
+                let run = replique::begin(app);
+                match r.writer().await {
+                    Ok(w) => (Sink::Remote(Box::new(w)), Some(run)),
+                    Err(e) => {
+                        d.error(format!("the Storage Box is unreachable: {e:#}"));
+                        return Err(DriveError::Unavailable(
+                            "This file is too big for the server and the Storage Box cannot be reached right now: try again later.".into(),
+                        ));
+                    }
+                }
             }
+            (None, false) => {
+                return Err(DriveError::Full(format!(
+                    "Without a Storage Box, the Drive keeps files on this server only, and this one does not fit in the {} allowed for it.",
+                    html::fmt_bytes(d.local_limit())
+                )));
+            }
+        };
+        let mut out = Vec::with_capacity(2 << 20);
+        let sealer = Sealer::new(&d.key, &mut out);
+        Ok(Session {
+            app: app.clone(),
+            owner,
+            folder: folder.id,
+            parts,
+            name,
+            sealed,
+            sink: Some(sink),
+            sealer: Some(sealer),
+            out,
+            plain_hash: Sha256::new(),
+            crc: crc32fast::Hasher::new(),
+            received: 0,
+            last_seen: Instant::now(),
+            remote: if run.is_some() { remote } else { None },
+            _inflight: inflight,
+            run,
+            up,
+        })
+    }
+
+    /// Takes the next bytes of the file.
+    pub async fn push(&mut self, chunk: &[u8]) -> Result<(), DriveError> {
+        self.last_seen = Instant::now();
+        if self.received + chunk.len() as u64 > self.up.size {
+            return Err(DriveError::Bad("The file is bigger than announced.".into()));
         }
-        if sealer.plain_len() != up.size {
-            return Err(DriveError::Bad("The upload was cut off.".into()));
+        let (Some(sealer), Some(sink)) = (self.sealer.as_mut(), self.sink.as_mut()) else {
+            return Err(DriveError::Gone(
+                "This upload was dropped: start it again.".into(),
+            ));
+        };
+        self.plain_hash.update(chunk);
+        self.crc.update(chunk);
+        sealer.push(chunk, &mut self.out);
+        if self.out.len() >= 1 << 20 {
+            if let Err(e) = sink.write(&self.out).await {
+                // The sink is broken: what it holds cannot be continued.
+                self.drop_sink().await;
+                return Err(e.into());
+            }
+            self.out.clear();
         }
+        self.received += chunk.len() as u64;
         Ok(())
     }
-    .await;
-    if let Err(e) = result {
-        sink.abort().await;
+
+    /// Takes a request body, piece by piece, until it ends or stalls. What
+    /// arrived before a break stays received.
+    pub async fn push_body(&mut self, body: Body) -> Result<(), DriveError> {
+        let mut stream = body.into_data_stream();
+        loop {
+            let next = tokio::time::timeout(PIECE_STALL, stream.next())
+                .await
+                .map_err(|_| DriveError::Bad("The upload stalled.".into()))?;
+            match next {
+                Some(Ok(chunk)) => self.push(&chunk).await?,
+                Some(Err(e)) => return Err(DriveError::Bad(format!("upload interrupted: {e}"))),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    async fn drop_sink(&mut self) {
+        self.sealer = None;
+        if let Some(sink) = self.sink.take() {
+            sink.abort().await;
+        }
+    }
+
+    pub async fn abort(mut self) {
+        self.drop_sink().await;
+    }
+
+    pub fn complete(&self) -> bool {
+        self.received == self.up.size
+    }
+
+    /// Seals the end, puts the object in place and the file in the tree.
+    pub async fn finish(mut self) -> Result<Node, DriveError> {
+        if !self.complete() {
+            return Err(DriveError::Bad("The upload was cut off.".into()));
+        }
+        let (Some(sealer), Some(mut sink)) = (self.sealer.take(), self.sink.take()) else {
+            return Err(DriveError::Gone(
+                "This upload was dropped: start it again.".into(),
+            ));
+        };
+        let app = self.app.clone();
+        let d = &app.drive;
+        let hash = sealer.finish(&mut self.out);
+        if let Err(e) = sink.write(&self.out).await {
+            sink.abort().await;
+            return Err(e.into());
+        }
+        let (local, remote_ok) = match sink {
+            Sink::Local(f, tmp) => {
+                f.sync_all().await?;
+                drop(f);
+                let dest = d.object_path(&hash);
+                tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+                tokio::fs::rename(&tmp, &dest).await?;
+                (true, false)
+            }
+            Sink::Remote(w) => {
+                let r = self.remote.as_ref().expect("a remote sink has a remote");
+                w.commit(&r.cfg.object_path(&hash)).await?;
+                if let Some(run) = &self.run {
+                    run.added(1, self.sealed);
+                }
+                (false, true)
+            }
+        };
+        let parent = app.db.ensure_dirs(
+            &self.folder,
+            &self.parts.iter().map(String::as_str).collect::<Vec<_>>(),
+            now(),
+        )?;
+        let crc = std::mem::take(&mut self.crc).finalize();
+        let node = app.db.add_file(&NewFile {
+            parent: &parent,
+            name: &self.name,
+            object: &hash,
+            sealed: self.sealed,
+            size: self.up.size,
+            sha256: &crypt::hex(&std::mem::take(&mut self.plain_hash).finalize()),
+            crc32: crc,
+            content_type: &self.up.content_type,
+            local,
+            remote: remote_ok,
+            replace: self.up.replace,
+            added_by: &self.up.by,
+            now: now(),
+        })?;
+        tracing::info!(
+            "drive: stored {} ({}, {})",
+            node.name,
+            html::fmt_bytes(self.up.size),
+            if local {
+                "on this server"
+            } else {
+                "on the Storage Box"
+            }
+        );
+        changed(&app);
+        let app2 = app.clone();
+        tokio::spawn(async move { alert::check_drive_usage(&app2).await });
+        Ok(node)
+    }
+}
+
+/// A whole upload in one request (scripts, `curl -T`).
+pub async fn receive(app: &Arc<App>, up: Upload, body: Body) -> Result<Node, DriveError> {
+    let mut s = Session::start(app, up, String::new()).await?;
+    if let Err(e) = s.push_body(body).await {
+        s.abort().await;
         return Err(e);
     }
-    let hash = sealer.finish(&mut sealer_out);
-    let written = async {
-        sink.write(&sealer_out).await?;
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(e) = written {
-        sink.abort().await;
-        return Err(e.into());
-    }
-    let (local, remote_ok) = match sink {
-        Sink::Local(f, tmp) => {
-            f.sync_all().await?;
-            drop(f);
-            let dest = d.object_path(&hash);
-            tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
-            tokio::fs::rename(&tmp, &dest).await?;
-            (true, false)
-        }
-        Sink::Remote(w) => {
-            let r = remote.as_ref().expect("a remote sink has a remote");
-            w.commit(&r.cfg.object_path(&hash)).await?;
-            if let Some(run) = &_run {
-                run.added(1, sealed);
+    s.finish().await
+}
+
+pub type Shared = Arc<tokio::sync::Mutex<Session>>;
+
+/// Keeps an upload to be continued; returns its id.
+pub fn keep(app: &App, s: Session) -> String {
+    let id = crate::token(24);
+    app.drive
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(s)));
+    id
+}
+
+pub fn session(app: &App, id: &str) -> Option<Shared> {
+    app.drive.sessions.lock().unwrap().get(id).cloned()
+}
+
+pub fn forget(app: &App, id: &str) -> Option<Shared> {
+    app.drive.sessions.lock().unwrap().remove(id)
+}
+
+/// Drops uploads nobody continued for a day.
+pub async fn sweep_sessions(app: &App) {
+    let idle: Vec<(String, Shared)> = app
+        .drive
+        .sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (id, s) in idle {
+        let stale = match s.try_lock() {
+            Ok(g) => g.last_seen.elapsed() > SESSION_IDLE,
+            Err(_) => false,
+        };
+        if stale && let Some(s) = forget(app, &id) {
+            tracing::info!("drive: dropping an upload left unfinished for a day");
+            if let Ok(m) = Arc::try_unwrap(s) {
+                m.into_inner().abort().await;
             }
-            (false, true)
         }
-    };
-    let parent = app.db.ensure_dirs(
-        &folder.id,
-        &parts.iter().map(String::as_str).collect::<Vec<_>>(),
-        now(),
-    )?;
-    let node = app.db.add_file(&NewFile {
-        parent: &parent,
-        name: &name,
-        object: &hash,
-        sealed,
-        size: up.size,
-        sha256: &crypt::hex(&plain_hash.finalize()),
-        content_type: &up.content_type,
-        local,
-        remote: remote_ok,
-        replace: up.replace,
-        added_by: &up.by,
-        now: now(),
-    })?;
-    tracing::info!(
-        "drive: stored {} ({}, {})",
-        node.name,
-        html::fmt_bytes(up.size),
-        if local {
-            "on this server"
-        } else {
-            "on the Storage Box"
-        }
-    );
-    changed(app);
-    let app2 = app.clone();
-    tokio::spawn(async move { alert::check_drive_usage(&app2).await });
-    Ok(node)
+    }
 }
 
 /// Types a browser shows itself without running anything.
@@ -456,6 +623,33 @@ fn parse_range(h: &str, size: u64) -> Option<(u64, u64)> {
     (start < end && start < size).then_some((start, end))
 }
 
+/// The bytes a request wants: a range (`partial`), or all of it when it
+/// asks for none, or when its `If-Range` names something that changed since.
+pub fn wanted_range(
+    headers: &HeaderMap,
+    size: u64,
+    etag: &str,
+) -> Result<(u64, u64, bool), Response> {
+    let still_same = headers
+        .get(header::IF_RANGE)
+        .and_then(|h| h.to_str().ok())
+        .is_none_or(|v| v.trim() == etag);
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .filter(|_| still_same)
+        .map(|h| parse_range(h, size));
+    match range {
+        Some(Some((s, e))) => Ok((s, e, true)),
+        Some(None) if size > 0 => Err((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+        )
+            .into_response()),
+        _ => Ok((0, size, false)),
+    }
+}
+
 /// A file (or one of its versions) for a browser, ranges included.
 pub async fn serve(
     app: &Arc<App>,
@@ -466,20 +660,10 @@ pub async fn serve(
     inline: bool,
 ) -> Response {
     let size = version.size;
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|h| h.to_str().ok())
-        .map(|h| parse_range(h, size));
-    let (start, end, partial) = match range {
-        Some(Some((s, e))) => (s, e, true),
-        Some(None) if size > 0 => {
-            return (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                [(header::CONTENT_RANGE, format!("bytes */{size}"))],
-            )
-                .into_response();
-        }
-        _ => (0, size, false),
+    let tag = format!("\"v-{}\"", version.id);
+    let (start, end, partial) = match wanted_range(headers, size, &tag) {
+        Ok(r) => r,
+        Err(res) => return res,
     };
     let body = if head || start == end {
         Body::empty()
@@ -513,6 +697,9 @@ pub async fn serve(
     );
     h.insert(header::CONTENT_LENGTH, (end - start).into());
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&tag) {
+        h.insert(header::ETAG, v);
+    }
     if partial && let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{}/{size}", end - 1)) {
         h.insert(header::CONTENT_RANGE, v);
     }
@@ -533,7 +720,7 @@ pub async fn serve(
 
 /// The plain bytes `start..end` of an object, from this server's copy if
 /// there is one, else from the box.
-async fn open_range(app: &Arc<App>, hash: &str, start: u64, end: u64) -> anyhow::Result<Body> {
+pub async fn open_range(app: &Arc<App>, hash: &str, start: u64, end: u64) -> anyhow::Result<Body> {
     let d = &app.drive;
     let obj = app
         .db
