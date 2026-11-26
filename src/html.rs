@@ -175,41 +175,57 @@ fn drop_zone(mode: &str, plain: &str, secret: &str, max: Option<u64>) -> String 
     let max_attr = max
         .map(|m| format!(" data-max=\"{m}\""))
         .unwrap_or_default();
-    let (what, choose) = if mode == "admin" {
-        ("Drop files or folders here", "choose files")
-    } else {
-        ("Drop a file or a folder here", "choose a file")
-    };
-    let options = if mode == "admin" {
-        "<div class=\"options\">\
-         <label>Expires <select id=\"expires\"><option value=\"\">never</option>\
-         <option value=\"3600\">in 1 hour</option><option value=\"86400\">in 1 day</option>\
-         <option value=\"604800\">in 7 days</option><option value=\"2592000\">in 30 days</option></select></label>\
-         <label><input type=\"checkbox\" id=\"secret\"> One-time secret \
-         <span class=\"muted\">end-to-end encrypted, opens once</span></label></div>"
-    } else {
-        ""
-    };
-    let text = if mode == "invite" {
-        String::new()
-    } else {
-        let hidden = if mode == "admin" { " hidden" } else { "" };
-        format!(
-            "<div class=\"text-secret\" id=\"text-panel\"{hidden}>\
-             <textarea id=\"secret-text\" rows=\"4\" maxlength=\"100000\" placeholder=\"…or write a secret text\"></textarea>\
-             <button type=\"button\" id=\"send-text\">Create secret link</button></div>"
+    let (what, secret_what, choose) = if mode == "admin" {
+        (
+            "Drop files or folders here",
+            "Drop secret files or folders here",
+            "choose files",
         )
+    } else {
+        (
+            "Drop a file or a folder here",
+            "Drop a secret file or a folder here",
+            "choose a file",
+        )
+    };
+    let shown = if mode == "invite-secret" { secret_what } else { what };
+    // The "Create secret link" button shows once some text is written: on the
+    // options line for the admin, under the text otherwise.
+    let send_text = "<button type=\"button\" id=\"send-text\" hidden>Create secret link</button>";
+    let options = if mode == "admin" {
+        format!(
+            "<div class=\"options\">\
+             <label>Expires <select id=\"expires\"><option value=\"\">never</option>\
+             <option value=\"3600\">in 1 hour</option><option value=\"86400\">in 1 day</option>\
+             <option value=\"604800\">in 7 days</option><option value=\"2592000\">in 30 days</option></select></label>\
+             <label><input type=\"checkbox\" id=\"secret\"> One-time secret \
+             <span class=\"muted\">end-to-end encrypted, opens once</span></label>{send_text}</div>"
+        )
+    } else {
+        String::new()
+    };
+    let text = match mode {
+        "invite" => String::new(),
+        "admin" => "<div class=\"text-secret\" id=\"text-panel\" hidden>\
+             <textarea id=\"secret-text\" rows=\"4\" maxlength=\"100000\" placeholder=\"…or write a secret text\"></textarea></div>"
+            .into(),
+        _ => format!(
+            "<div class=\"text-secret\" id=\"text-panel\">\
+             <textarea id=\"secret-text\" rows=\"4\" maxlength=\"100000\" placeholder=\"…or write a secret text\"></textarea>\
+             {send_text}</div>"
+        ),
     };
     let multiple = if mode == "admin" { " multiple" } else { "" };
     format!(
-        "<div id=\"drop\" class=\"drop\" data-mode=\"{mode}\" data-plain=\"{}\" data-secret=\"{}\"{max_attr}>\
-         <p class=\"big\">{what}</p>\
+        "<div id=\"drop\" class=\"drop\" data-mode=\"{mode}\" data-plain=\"{}\" data-secret=\"{}\"{max_attr} \
+         data-what=\"{what}\" data-secret-what=\"{secret_what}\">\
+         <p class=\"big\" id=\"drop-what\">{shown}</p>\
          <p class=\"muted\">or <button type=\"button\" class=\"pick\" data-pick=\"files\">{choose}</button> · \
          <button type=\"button\" class=\"pick\" data-pick=\"folder\">choose a folder</button> \
          (sent as a zip)</p></div>\
          <input type=\"file\" id=\"pick-files\"{multiple} hidden>\
          <input type=\"file\" id=\"pick-folder\" webkitdirectory hidden>\
-         {options}{text}<ul id=\"uploads\" class=\"uploads\"></ul>",
+         {text}{options}<ul id=\"uploads\" class=\"uploads\"></ul>",
         esc(plain),
         esc(secret),
     )

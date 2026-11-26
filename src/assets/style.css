@@ -50,10 +50,12 @@ a { color: var(--accent); }
 button.pick { background: none; border: none; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; }
 .options { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; margin: 14px 2px; font-size: 14px; }
 .options label { flex-direction: row; align-items: center; gap: 8px; font-size: 14px; color: var(--fg); }
-.text-secret { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.drop.secret { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.text-secret { display: flex; flex-direction: column; gap: 8px; margin: 14px 0 16px; }
+.options #send-text { margin-left: auto; }
 textarea { font: 14px/1.4 ui-monospace, monospace; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
   background: var(--card); color: var(--fg); width: 100%; resize: vertical; }
-.text-secret button { align-self: flex-start; }
+.text-secret button { align-self: flex-end; }
 .uploads { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
 .uploads li { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .uploads .title { display: flex; justify-content: space-between; gap: 12px; }

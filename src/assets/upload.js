@@ -148,8 +148,18 @@ if (drop) {
   const expires = document.getElementById('expires'), list = document.getElementById('uploads');
   const pickFiles = document.getElementById('pick-files'), pickFolder = document.getElementById('pick-folder');
   const isSecret = () => cfg.mode === 'invite-secret' || !!(secretBox && secretBox.checked);
+  const secretText = document.getElementById('secret-text'), sendText = document.getElementById('send-text');
+  // "Create secret link" shows only once there is text to send, and the text panel is open.
+  const syncSend = () => { if (sendText) sendText.hidden = !secretText.value || textPanel.hidden; };
+  if (secretText) secretText.oninput = syncSend;
   if (secretBox) {
-    const sync = () => { textPanel.hidden = !secretBox.checked; };
+    const what = document.getElementById('drop-what');
+    const sync = () => {
+      textPanel.hidden = !secretBox.checked;
+      what.textContent = secretBox.checked ? cfg.secretWhat : cfg.what;
+      drop.classList.toggle('secret', secretBox.checked);
+      syncSend();
+    };
     secretBox.onchange = sync; sync();
   }
   const queue = []; let running = false;
@@ -174,6 +184,7 @@ if (drop) {
     if (!single) return;
     drop.classList.toggle('done', on);
     if (textPanel) textPanel.hidden = on;
+    syncSend();
   }
   function add(items) {
     items = items.filter(Boolean);
@@ -331,12 +342,12 @@ if (drop) {
     }
     add(items);
   };
-  const sendText = document.getElementById('send-text');
   if (sendText) sendText.onclick = () => {
-    const t = document.getElementById('secret-text');
-    if (!t.value) return t.focus();
-    add([{name: 'Secret text', text: t.value, secret: true}]);
-    t.value = '';
+    if (!secretText.value) return secretText.focus();
+    const text = secretText.value;
+    secretText.value = '';
+    syncSend();
+    add([{name: 'Secret text', text, secret: true}]);
   };
 }
 
